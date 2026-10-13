@@ -3362,102 +3362,234 @@ void EnableBlurBehind(HWND hwnd) {
 }
 
 // ── Backdrop material (#59) ──────────────────────────────────────────────────
-// Real Windows blur/acrylic behind the island.
-//
-// This uses SetWindowCompositionAttribute, which is the same undocumented entry
-// point Windows' own shell surfaces use for acrylic. It is resolved dynamically
-// so the mod still loads cleanly on builds where it is absent, and every failure
-// path simply leaves the island fully opaque rather than breaking rendering.
-//
-// It composes with UpdateLayeredWindow: DWM blurs whatever is behind the window,
-// and the per-pixel alpha we paint decides how much of that blur shows through.
-// That is why enabling a backdrop also caps the pill's own fill alpha further
-// down -- an opaque fill would hide the very effect being switched on.
+// Software blur/acrylic: the desktop behind the window is captured, blurred and
+// used as the pill's fill brush, so it follows the island's shape exactly.
 namespace Backdrop {
 
-enum CompositionAttribute : int {
-    WCA_ACCENT_POLICY = 19,
-};
+// Minimum time between backdrop re-captures while the island is visible.
+constexpr double kRefreshSeconds = 0.012;
 
-enum AccentState : int {
-    ACCENT_DISABLED = 0,
-    ACCENT_ENABLE_BLURBEHIND = 3,
-    ACCENT_ENABLE_ACRYLICBLURBEHIND = 4,
-};
+// Odd box sizes whose 3-pass composition approximates a Gaussian of stddev sigma.
+void BoxesForGauss(double sigma, int n, int* sizes) {
+    const double wIdeal = std::sqrt(12.0 * sigma * sigma / n + 1.0);
+    int wl = static_cast<int>(std::floor(wIdeal));
+    if (wl % 2 == 0) --wl;
+    if (wl < 1) wl = 1;
+    const int wu = wl + 2;
+    const double mIdeal =
+        (12.0 * sigma * sigma - n * wl * wl - 4.0 * n * wl - 3.0 * n) / (-4.0 * wl - 4.0);
+    const int m = static_cast<int>(std::lround(mIdeal));
+    for (int i = 0; i < n; ++i) sizes[i] = (i < m) ? wl : wu;
+}
 
-struct AccentPolicy {
-    AccentState state;
-    DWORD flags;
-    DWORD gradientColor;  // ABGR
-    DWORD animationId;
-};
-
-struct CompositionAttributeData {
-    CompositionAttribute attribute;
-    void* data;
-    SIZE_T dataSize;
-};
-
-using SetWindowCompositionAttributeFn = BOOL(WINAPI*)(HWND, CompositionAttributeData*);
-
-SetWindowCompositionAttributeFn Resolve() {
-    static SetWindowCompositionAttributeFn cached = [] {
-        // user32 is already loaded in-process; GetModuleHandle avoids taking a
-        // reference we would then have to release.
-        HMODULE user32 = GetModuleHandleW(L"user32.dll");
-        if (!user32) {
-            return static_cast<SetWindowCompositionAttributeFn>(nullptr);
+// One box-blur pass (radius r) over 8-bit BGRA; horiz scans rows, else columns.
+void BoxBlurPass(const uint8_t* src, uint8_t* dst, int w, int h, int r, bool horiz) {
+    const int len = horiz ? w : h;
+    const int lines = horiz ? h : w;
+    const size_t stepPx = horiz ? 4 : static_cast<size_t>(w) * 4;
+    const size_t stepLine = horiz ? static_cast<size_t>(w) * 4 : 4;
+    const int div = 2 * r + 1;
+    for (int l = 0; l < lines; ++l) {
+        const uint8_t* s = src + static_cast<size_t>(l) * stepLine;
+        uint8_t* d = dst + static_cast<size_t>(l) * stepLine;
+        for (int c = 0; c < 3; ++c) {
+            int sum = s[c] * r;
+            for (int k = 0; k <= r; ++k) {
+                sum += s[static_cast<size_t>(std::min(k, len - 1)) * stepPx + c];
+            }
+            for (int i = 0; i < len; ++i) {
+                d[static_cast<size_t>(i) * stepPx + c] =
+                    static_cast<uint8_t>((sum + div / 2) / div);
+                const int add = std::min(i + r + 1, len - 1);
+                const int sub = std::max(i - r, 0);
+                sum += s[static_cast<size_t>(add) * stepPx + c] -
+                       s[static_cast<size_t>(sub) * stepPx + c];
+            }
         }
-        return reinterpret_cast<SetWindowCompositionAttributeFn>(
-            GetProcAddress(user32, "SetWindowCompositionAttribute"));
-    }();
-    return cached;
+        for (int i = 0; i < len; ++i) d[static_cast<size_t>(i) * stepPx + 3] = 255;
+    }
+}
+
+void GaussianBlurBGRA(std::vector<uint32_t>& px, int w, int h, double sigma) {
+    if (w <= 0 || h <= 0 || sigma < 0.45) return;
+    int sizes[3];
+    BoxesForGauss(sigma, 3, sizes);
+    std::vector<uint32_t> tmp(px.size());
+    for (int i = 0; i < 3; ++i) {
+        const int r = (sizes[i] - 1) / 2;
+        if (r < 1) continue;
+        BoxBlurPass(reinterpret_cast<const uint8_t*>(px.data()),
+                    reinterpret_cast<uint8_t*>(tmp.data()), w, h, r, true);
+        BoxBlurPass(reinterpret_cast<const uint8_t*>(tmp.data()),
+                    reinterpret_cast<uint8_t*>(px.data()), w, h, r, false);
+    }
+}
+
+// Downscales a w x h BGRA capture by `factor`, blurs it and (for acrylic)
+// boosts saturation (satPct 100 = none, 125 = Windows acrylic). Fully opaque.
+void BuildBackdrop(const uint32_t* src, int w, int h, int factor, double sigmaPx, int satPct,
+                   std::vector<uint32_t>& out, int& ow, int& oh) {
+    factor = std::max(1, factor);
+    ow = (w + factor - 1) / factor;
+    oh = (h + factor - 1) / factor;
+    out.assign(static_cast<size_t>(ow) * oh, 0xFF000000u);
+    for (int y = 0; y < oh; ++y) {
+        for (int x = 0; x < ow; ++x) {
+            unsigned b = 0, g = 0, r = 0, n = 0;
+            const int y1 = std::min(h, (y + 1) * factor);
+            const int x1 = std::min(w, (x + 1) * factor);
+            for (int yy = y * factor; yy < y1; ++yy) {
+                const uint32_t* row = src + static_cast<size_t>(yy) * w;
+                for (int xx = x * factor; xx < x1; ++xx) {
+                    const uint32_t p = row[xx];
+                    b += p & 0xFF;
+                    g += (p >> 8) & 0xFF;
+                    r += (p >> 16) & 0xFF;
+                    ++n;
+                }
+            }
+            if (!n) n = 1;
+            out[static_cast<size_t>(y) * ow + x] =
+                0xFF000000u | ((r / n) << 16) | ((g / n) << 8) | (b / n);
+        }
+    }
+    GaussianBlurBGRA(out, ow, oh, sigmaPx / factor);
+    if (satPct != 100) {
+        const int sat = satPct * 256 / 100;
+        for (auto& p : out) {
+            int b = p & 0xFF, g = (p >> 8) & 0xFF, r = (p >> 16) & 0xFF;
+            const int lum = (54 * r + 183 * g + 19 * b) >> 8;
+            r = std::clamp(lum + (((r - lum) * sat) >> 8), 0, 255);
+            g = std::clamp(lum + (((g - lum) * sat) >> 8), 0, 255);
+            b = std::clamp(lum + (((b - lum) * sat) >> 8), 0, 255);
+            p = 0xFF000000u | (static_cast<uint32_t>(r) << 16) |
+                (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+        }
+    }
+}
+
+// GDI objects reused between captures; rebuilt only when the size changes.
+// Render thread only.
+struct CaptureCache {
+    HDC mem = nullptr;
+    HBITMAP dib = nullptr;
+    HGDIOBJ oldBmp = nullptr;
+    void* bits = nullptr;
+    int w = 0;
+    int h = 0;
+};
+CaptureCache g_captureCache;
+
+void ReleaseCaptureCache() {
+    CaptureCache& c = g_captureCache;
+    if (c.mem && c.oldBmp) {
+        SelectObject(c.mem, c.oldBmp);
+    }
+    if (c.dib) DeleteObject(c.dib);
+    if (c.mem) DeleteDC(c.mem);
+    c = CaptureCache{};
+}
+
+// Captures the screen region (x, y, w, h) into `out`, downscaled and blurred.
+bool Capture(int x, int y, int w, int h, double sigmaPx, int satPct,
+             std::vector<uint32_t>& out, int& ow, int& oh) {
+    if (w <= 0 || h <= 0) {
+        return false;
+    }
+    HDC screen = GetDC(nullptr);
+    if (!screen) {
+        return false;
+    }
+    CaptureCache& c = g_captureCache;
+    if (!c.mem) {
+        c.mem = CreateCompatibleDC(screen);
+    }
+    if (c.mem && (!c.dib || c.w != w || c.h != h)) {
+        if (c.dib) {
+            SelectObject(c.mem, c.oldBmp);
+            DeleteObject(c.dib);
+            c.dib = nullptr;
+            c.oldBmp = nullptr;
+            c.bits = nullptr;
+        }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        c.dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &c.bits, nullptr, 0);
+        if (c.dib && c.bits) {
+            c.oldBmp = SelectObject(c.mem, c.dib);
+            c.w = w;
+            c.h = h;
+        } else {
+            if (c.dib) DeleteObject(c.dib);
+            c.dib = nullptr;
+            c.bits = nullptr;
+        }
+    }
+    bool ok = false;
+    if (c.mem && c.dib && c.bits) {
+        ok = BitBlt(c.mem, 0, 0, w, h, screen, x, y, SRCCOPY) != 0;
+        if (ok) {
+            GdiFlush();
+            const int factor = std::clamp(static_cast<int>(sigmaPx / 3.0), 1, 4);
+            BuildBackdrop(reinterpret_cast<const uint32_t*>(c.bits), w, h, factor, sigmaPx, satPct,
+                          out, ow, oh);
+        }
+    }
+    ReleaseDC(nullptr, screen);
+    return ok;
+}
+
+// Set on startup and when the material changes, to force a fresh capture.
+std::atomic<bool> g_recaptureRequested{true};
+
+// True while the foreground window belongs to the Snipping Tool / screen clip UI.
+bool ScreenClipUiActive() {
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    if (!pid) return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH] = {};
+    DWORD n = MAX_PATH;
+    bool hit = false;
+    if (QueryFullProcessImageNameW(h, 0, path, &n)) {
+        const wchar_t* name = wcsrchr(path, L'\\');
+        name = name ? name + 1 : path;
+        hit = _wcsicmp(name, L"SnippingTool.exe") == 0 ||
+              _wcsicmp(name, L"ScreenClippingHost.exe") == 0;
+    }
+    CloseHandle(h);
+    return hit;
+}
+
+// While the Snipping Tool overlay is foreground the island must not raise or
+// show itself. Cached for 100 ms since this is checked every frame.
+bool ClipUiActiveCached() {
+    static std::atomic<ULONGLONG> lastCheck{0};
+    static std::atomic<bool> last{false};
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastCheck.load() >= 100) {
+        last.store(ScreenClipUiActive());
+        lastCheck.store(now);
+    }
+    return last.load();
 }
 
 }  // namespace Backdrop
 
+// Clears any capture exclusion and requests a fresh backdrop capture.
 void ApplyBackdropMaterial(HWND hwnd) {
-    if (!hwnd) {
-        return;
+    Backdrop::g_recaptureRequested.store(true);
+    if (hwnd) {
+        SetWindowDisplayAffinity(hwnd, 0);  // WDA_NONE
     }
-
-    const auto setAttribute = Backdrop::Resolve();
-    if (!setAttribute) {
-        return;  // Unsupported build; island stays opaque.
-    }
-
-    Backdrop::AccentPolicy policy = {};
-    switch (g_settings.backdropMaterial) {
-        case BackdropMaterial::Blur:
-            policy.state = Backdrop::ACCENT_ENABLE_BLURBEHIND;
-            break;
-        case BackdropMaterial::Acrylic:
-            policy.state = Backdrop::ACCENT_ENABLE_ACRYLICBLURBEHIND;
-            break;
-        case BackdropMaterial::None:
-        default:
-            policy.state = Backdrop::ACCENT_DISABLED;
-            break;
-    }
-
-    // Acrylic needs a tint supplied in the policy itself; the shell mixes this
-    // over the blurred backdrop. Stored ABGR, and the alpha here is the tint
-    // strength rather than the window's opacity.
-    if (policy.state == Backdrop::ACCENT_ENABLE_ACRYLICBLURBEHIND) {
-        const D2D1_COLOR_F tint = g_settings.pillBgColor;
-        const auto channel = [](float v) {
-            return static_cast<DWORD>(Clamp(v, 0.0f, 1.0f) * 255.0f);
-        };
-        const DWORD tintAlpha = channel(g_settings.backdropTint);
-        policy.gradientColor = (tintAlpha << 24) | (channel(tint.b) << 16) |
-                               (channel(tint.g) << 8) | channel(tint.r);
-    }
-
-    Backdrop::CompositionAttributeData data = {};
-    data.attribute = Backdrop::WCA_ACCENT_POLICY;
-    data.data = &policy;
-    data.dataSize = sizeof(policy);
-    setAttribute(hwnd, &data);
 }
 
 // Always unregisters before registering so a settings change never leaks the
@@ -3603,8 +3735,11 @@ void PositionOverlayWindow(HWND hwnd, int width, int height) {
 
     x += g_settings.offsetX;
     y += ResolveOffsetY(static_cast<float>(height));
-    SetWindowPos(hwnd, zOrder, x, y, width, height,
-                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    // Yield to the screen-clip overlay.
+    const bool yieldToClipUi = Backdrop::ClipUiActiveCached();
+    SetWindowPos(hwnd, yieldToClipUi ? nullptr : zOrder, x, y, width, height,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                     (yieldToClipUi ? SWP_NOZORDER : SWP_SHOWWINDOW));
 
     ApplyBackdropRegion(hwnd, width, height);
 }
@@ -3681,8 +3816,7 @@ struct PillClientRect {
 };
 PillClientRect g_pillClientRect;
 
-// Blur/acrylic paints across the whole window rect, so it keeps the old
-// "window hugs the pill" behaviour.
+// The software backdrop captures the whole window rect, so keep it small.
 inline bool UsesFixedStage(const Settings& s) {
     return s.backdropMaterial == BackdropMaterial::None;
 }
@@ -3755,8 +3889,11 @@ void ApplyOverlayZOrder(HWND hwnd, int width, int height) {
         }
     }
 
-    SetWindowPos(hwnd, zOrder, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    // Yield to the screen-clip overlay.
+    const bool yieldToClipUi = Backdrop::ClipUiActiveCached();
+    SetWindowPos(hwnd, yieldToClipUi ? nullptr : zOrder, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                     (yieldToClipUi ? SWP_NOZORDER : SWP_SHOWWINDOW));
     ApplyBackdropRegion(hwnd, width, height);
 }
 
@@ -3862,6 +3999,9 @@ bool IsShellOwnedWindow(HWND hwnd) {
 // surfaces away from Windows.
 void EnsureTopmost(HWND hwnd, const RECT* pillScreenRect = nullptr) {
     if (!g_settings.alwaysOnTop || !IsWindow(hwnd) || !IsWindowVisible(hwnd)) {
+        return;
+    }
+    if (Backdrop::ClipUiActiveCached()) {
         return;
     }
 
@@ -11494,6 +11634,125 @@ class Renderer {
         return CreateBackingBitmap(520, 140);
     }
 
+    // Refreshes the desktop capture and the backdrop brush, throttled to
+    // Backdrop::kRefreshSeconds. (winX, winY) is where this frame will be placed.
+    void UpdateBackdrop(const Settings& settings, int winX, int winY, int winW, int winH,
+                        double now) {
+        if (settings.backdropMaterial == BackdropMaterial::None) {
+            backdropBrush_.Reset();
+            backdropBmp_.Reset();
+            return;
+        }
+        if (!target_) {
+            return;
+        }
+
+        const double since = now - backdropCapturedAt_;
+        const bool firstCapture = backdropPx_.empty();
+        const bool materialChanged = settings.backdropMaterial != backdropMaterial_;
+        const bool forced = Backdrop::g_recaptureRequested.exchange(false);
+
+        if ((firstCapture || materialChanged || forced || since >= Backdrop::kRefreshSeconds) &&
+            winW > 0 && winH > 0) {
+            const double sigmaPx = 30.0;
+            const int satPct = (settings.backdropMaterial == BackdropMaterial::Acrylic) ? 125 : 100;
+            int ow = 0, oh = 0;
+            std::vector<uint32_t> px;
+            if (Backdrop::Capture(winX, winY, winW, winH, sigmaPx, satPct, px, ow, oh) &&
+                ow > 0 && oh > 0) {
+                // Only rebuild the D2D bitmap/brush when the result changed.
+                const bool changed = ow != backdropW_ || oh != backdropH_ ||
+                                     settings.backdropMaterial != backdropMaterial_ ||
+                                     px != backdropPx_;
+                backdropPx_ = std::move(px);
+                backdropW_ = ow;
+                backdropH_ = oh;
+                backdropMaterial_ = settings.backdropMaterial;
+                backdropCapturedAt_ = now;
+                if (changed) {
+                    backdropDirty_ = true;
+                }
+            }
+        }
+
+        if (backdropPx_.empty() || backdropW_ <= 0 || backdropH_ <= 0) {
+            backdropBrush_.Reset();
+            backdropBmp_.Reset();
+            return;
+        }
+
+        if (backdropDirty_ || !backdropBmp_) {
+            backdropBrush_.Reset();
+            backdropBmp_.Reset();
+            D2D1_BITMAP_PROPERTIES bp = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f,
+                96.0f);
+            const HRESULT bmpHr = target_->CreateBitmap(
+                D2D1::SizeU(static_cast<UINT32>(backdropW_), static_cast<UINT32>(backdropH_)),
+                backdropPx_.data(), static_cast<UINT32>(backdropW_) * 4, &bp, &backdropBmp_);
+            if (SUCCEEDED(bmpHr) && backdropBmp_) {
+                D2D1_BITMAP_BRUSH_PROPERTIES bbp = D2D1::BitmapBrushProperties(
+                    D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                if (FAILED(target_->CreateBitmapBrush(backdropBmp_.Get(), &bbp, nullptr,
+                                                      &backdropBrush_)) ||
+                    !backdropBrush_) {
+                    backdropBmp_.Reset();
+                }
+            }
+            if (backdropBmp_) {
+                backdropDirty_ = false;
+            }
+        }
+
+        if (backdropBrush_) {
+            // Stretch the downscaled capture over the whole window.
+            const D2D1_MATRIX_3X2_F m = D2D1::Matrix3x2F::Scale(
+                static_cast<float>(winW) / static_cast<float>(backdropW_),
+                static_cast<float>(winH) / static_cast<float>(backdropH_));
+            backdropBrush_->SetTransform(&m);
+        }
+    }
+
+    // Throttled capture between frames; returns true if the blurred result
+    // changed and a repaint is needed. Render thread only.
+    bool PollBackdropChanged(BackdropMaterial material, double now) {
+        if (material == BackdropMaterial::None || !target_ || !hwnd_) {
+            return false;
+        }
+        const bool forced = Backdrop::g_recaptureRequested.exchange(false);
+        if (!forced && now - backdropCapturedAt_ < Backdrop::kRefreshSeconds) {
+            return false;
+        }
+        RECT wr = {};
+        if (!GetWindowRect(hwnd_, &wr)) {
+            return false;
+        }
+        const int w = wr.right - wr.left;
+        const int h = wr.bottom - wr.top;
+        if (w <= 0 || h <= 0) {
+            return false;
+        }
+        const int satPct = (material == BackdropMaterial::Acrylic) ? 125 : 100;
+        int ow = 0, oh = 0;
+        std::vector<uint32_t> px;
+        if (!Backdrop::Capture(wr.left, wr.top, w, h, 30.0, satPct, px, ow, oh) || ow <= 0 ||
+            oh <= 0) {
+            return forced;
+        }
+        backdropCapturedAt_ = now;
+        const bool changed = forced || ow != backdropW_ || oh != backdropH_ ||
+                             material != backdropMaterial_ || px != backdropPx_;
+        if (changed) {
+            backdropPx_ = std::move(px);
+            backdropW_ = ow;
+            backdropH_ = oh;
+            backdropMaterial_ = material;
+            backdropDirty_ = true;
+        }
+        return changed;
+    }
+
     bool Render(const SharedState& state, const Settings& settings, const Activity& primary,
                 const std::optional<Activity>& secondary, float width, float height,
                 float nudge, bool hover, bool pinned, double now) {
@@ -11566,6 +11825,8 @@ class Renderer {
         if (FAILED(hr)) {
             return false;
         }
+
+        UpdateBackdrop(settings, stage.origin.x, stage.origin.y, pixelWidth, pixelHeight, now);
 
         target_->BeginDraw();
         target_->SetTransform(D2D1::Matrix3x2F::Translation(-static_cast<float>(dirty.left),
@@ -11661,6 +11922,9 @@ class Renderer {
     }
 
     void Shutdown() {
+        backdropBrush_.Reset();
+        backdropBmp_.Reset();
+        backdropPx_.clear();
         ReleaseCachedResources();
         marqueeTitleCache_.layout.Reset();
         marqueeArtistCache_.layout.Reset();
@@ -12802,14 +13066,27 @@ class Renderer {
             FillIslandShape(rect, radius, settings.w11Style, settings.notchStyle, tintBrush_.Get());
         }
 
+        // Software backdrop, then the acrylic tint over it.
+        if (backdropBrush_ && settings.backdropMaterial != BackdropMaterial::None) {
+            FillIslandShape(rect, radius, settings.w11Style, settings.notchStyle,
+                            backdropBrush_.Get());
+            if (settings.backdropMaterial == BackdropMaterial::Acrylic) {
+                D2D1_COLOR_F tint = pillBgColor_;
+                tint.a = Clamp(settings.backdropTint, 0.0f, 1.0f);
+                if (ID2D1SolidColorBrush* acrylicTint = AcquireBrush(tint)) {
+                    FillIslandShape(rect, radius, settings.w11Style, settings.notchStyle,
+                                    acrylicTint);
+                }
+            }
+        }
+
         // User-defined pill background color. The authored alpha is combined
         // with the global pill transparency, so a plain 6-digit hex behaves
         // exactly as before (alpha 1.0) while #RRGGBBAA stays translucent.
         D2D1_COLOR_F bg = pillBgColor_;
         bg.a = Clamp(bg.a * settingsOpacity_, 0.0f, 1.0f);
         if (settings.backdropMaterial != BackdropMaterial::None) {
-            // DWM is blurring what is behind the window; an opaque fill would
-            // hide it entirely, so cap the fill and let the backdrop through.
+            // An opaque fill would hide the backdrop, so cap it.
             bg.a = std::min(bg.a, settings.backdropFillAlpha);
         }
         if (ID2D1SolidColorBrush* fillBrush = AcquireBrush(bg)) {
@@ -20255,6 +20532,16 @@ class Renderer {
     bool stageValid_ = false;
     double lastFullPaint_ = -1e9;
 
+    // Software backdrop (#59)
+    std::vector<uint32_t> backdropPx_;
+    int backdropW_ = 0;
+    int backdropH_ = 0;
+    BackdropMaterial backdropMaterial_ = BackdropMaterial::None;
+    double backdropCapturedAt_ = -1.0e9;
+    bool backdropDirty_ = false;
+    ComPtr<ID2D1Bitmap> backdropBmp_;
+    ComPtr<ID2D1BitmapBrush> backdropBrush_;
+
     ComPtr<ID2D1Factory> d2dFactory_;
     ComPtr<ID2D1DCRenderTarget> target_;
     ComPtr<IDWriteFactory> dwriteFactory_;
@@ -23237,6 +23524,14 @@ DWORD WINAPI RenderThreadProc(void*) {
             prevCtrlHoverCT = ctrlHoverCT;
         }
 
+        // Keep the backdrop tracking the desktop; skipped while hidden.
+        if (g_settings.backdropMaterial != BackdropMaterial::None && !isHidden &&
+            widthSpring.value > 8.0f && heightSpring.value > 8.0f) {
+            if (!needsRender && renderer.PollBackdropChanged(g_settings.backdropMaterial, now)) {
+                needsRender = true;
+            }
+        }
+
         if (needsRender) {
             // When Ctrl+hover click-through is active, reduce pill opacity so the
             // island becomes visually see-through to match the pass-through behavior.
@@ -23369,6 +23664,7 @@ DWORD WINAPI RenderThreadProc(void*) {
     setHighResTimer(false);
 
     UnbindVolumeEndpoint();
+    Backdrop::ReleaseCaptureCache();
     renderer.Shutdown();
     DestroyWindow(hwnd);
     g_hwnd = nullptr;
